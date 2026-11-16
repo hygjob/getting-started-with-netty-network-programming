@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Netty WebSocket 채팅 서비스</title>
+  <style>
+    body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem; font-family: sans-serif; }
+    form { margin: .6rem 0; }
+    input { padding: .5rem; }
+    #message { width: 60%; }
+    button { padding: .5rem; }
+    #log { min-height: 12rem; max-height: 24rem; overflow: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Netty WebSocket 채팅 서비스</h1>
+  <p id="status" role="status">연결되지 않았습니다.</p>
+  <form id="login-form">
+    <label for="user">사용자 이름</label>
+    <input id="user" pattern="[a-z0-9_\-]{2,20}" autocomplete="username" required>
+    <label for="password">실습 접속 암호</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button>로그인</button>
+  </form>
+  <button id="connect">연결</button>
+  <button id="disconnect" disabled>연결 종료</button>
+  <form id="room-form">
+    <label for="room">채팅방</label>
+    <input id="room" value="lobby" pattern="[a-z0-9_\-]{1,20}" required>
+    <button id="join" disabled>입장</button>
+  </form>
+  <form id="form">
+    <label for="message">메시지</label>
+    <input id="message" autocomplete="off" required>
+    <button id="send" disabled>보내기</button>
+  </form>
+  <pre id="log" aria-live="polite"></pre>
+  <script>
+    const $ = selector => document.querySelector(selector);
+    const status = $('#status');
+    const log = $('#log');
+    const connectButton = $('#connect');
+    const disconnectButton = $('#disconnect');
+    const joinButton = $('#join');
+    const sendButton = $('#send');
+    const input = $('#message');
+    const lines = [];
+    // 서버 ACK를 받지 못한 메시지입니다. id -> { room, text }
+    const outbox = new Map();
+    // 정책 위반, 다른 연결에 의한 대체처럼 다시 연결해도 같은 결과가 나올 종료 코드입니다.
+    const NO_RETRY = new Set([1003, 1008, 1009, 4000]);
+    const MAX_ATTEMPTS = 8;
+    let socket = null;
+    let me = null;
+    let room = null;
+    let wanted = false;
+    let attempt = 0;
+    let retryTimer = null;
+
+    function append(text) {
+      lines.push(text);
+      if (lines.length > 200) lines.shift();
+      log.textContent = lines.join('\n');
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // 앞에서부터 count-1개의 공백까지만 나눕니다. 마지막 칸은 공백을 포함한 본문입니다.
+    function parts(line, count) {
+      const out = [];
+      let rest = line;
+      for (let i = 1; i < count; i++) {
+        const at = rest.indexOf(' ');
+        if (at < 0) break;
+        out.push(rest.slice(0, at));
+        rest = rest.slice(at + 1);
+      }
+      out.push(rest);
+      return out;
+    }
+
+    function newId() {
+      if (crypto.randomUUID) return crypto.randomUUID();
+      return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    }
+
+    function isOpen() {
+      return socket !== null && socket.readyState === WebSocket.OPEN;
+    }
+
+    function update() {
+      sendButton.disabled = !isOpen();
+      joinButton.disabled = !isOpen();
+      connectButton.disabled = wanted;
+      disconnectButton.disabled = !wanted;
+    }
+
+    function sendSay(id) {
+      const item = outbox.get(id);
+      if (item && isOpen()) socket.send(`SAY ${id} ${item.text}`);
+    }
+
+    function receive(line) {
+      const kind = parts(line, 2)[0];
+      if (kind === 'WELCOME') {
+        me = parts(line, 2)[1];
+        append(`${me}(으)로 연결되었습니다.`);
+        // 재연결이면 이전 채팅방에 다시 들어갑니다. 서버는 새 연결을 새 세션으로 봅니다.
+        if (room) socket.send(`JOIN ${room}`);
+      } else if (kind === 'JOINED') {
+        const [, joined, user] = parts(line, 3);
+        append(`* ${user}님이 ${joined}에 입장했습니다.`);
+        if (user !== me) return;
+        room = joined;
+        // ACK를 받지 못한 메시지를 같은 ID로 다시 보냅니다. 서버가 이미 받았다면 ACK만 돌아옵니다.
+        for (const [id, item] of outbox) {
+          if (item.room === joined) {
+            sendSay(id);
+          } else {
+            outbox.delete(id);
+            append(`전송을 확인하지 못한 메시지를 버렸습니다: ${item.text}`);
+          }
+        }
+      } else if (kind === 'LEFT') {
+        const [, left, user] = parts(line, 3);
+        append(`* ${user}님이 ${left}에서 나갔습니다.`);
+      } else if (kind === 'MSG') {
+        const [, from, user, , text] = parts(line, 5);
+        append(`[${from}] ${user}: ${text}`);
+      } else if (kind === 'ACK') {
+        outbox.delete(parts(line, 2)[1]);
+      } else if (kind === 'ERROR') {
+        const [, code, ref] = parts(line, 3);
+        if (code === 'busy' && outbox.has(ref)) {
+          append('서버가 바쁩니다. 잠시 후 다시 보냅니다.');
+          setTimeout(() => sendSay(ref), 1000 + Math.random() * 1000);
+          return;
+        }
+        if (code !== 'shutting_down') outbox.delete(ref);
+        append(`오류: ${code}${ref ? ` (${ref})` : ''}`);
+      } else {
+        append(line);
+      }
+    }
+
+    function open() {
+      const url = new URL('/ws', location.href);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const current = new WebSocket(url);
+      socket = current;
+      status.textContent = attempt === 0 ? '연결 중입니다.' : `다시 연결하는 중입니다. (${attempt}회째)`;
+      current.onopen = () => {
+        attempt = 0;
+        status.textContent = '연결되었습니다.';
+        update();
+      };
+      current.onmessage = event => receive(String(event.data));
+      current.onclose = event => {
+        if (socket !== current) return;
+        socket = null;
+        status.textContent = `연결 종료: 코드 ${event.code}`;
+        if (wanted && NO_RETRY.has(event.code)) {
+          wanted = false;
+          append('다시 연결해도 같은 결과가 예상되는 종료입니다. 원인을 확인하십시오.');
+        } else if (wanted && attempt >= MAX_ATTEMPTS) {
+          wanted = false;
+          append('재연결을 중단했습니다. 다시 로그인한 뒤 연결하십시오.');
+        } else if (wanted) {
+          // 지수 백오프와 전체 지터: 상한은 0.5초에서 15초까지 늘고, 그 안의 임의 시점에 시도합니다.
+          const ceiling = Math.min(15000, 500 * 2 ** attempt);
+          attempt++;
+          retryTimer = setTimeout(open, Math.random() * ceiling);
+        }
+        update();
+      };
+    }
+
+    $('#login-form').onsubmit = async event => {
+      event.preventDefault();
+      const password = $('#password');
+      try {
+        const response = await fetch('/session', {
+          method: 'POST',
+          credentials: 'same-origin',
+          body: new URLSearchParams({ user: $('#user').value, password: password.value })
+        });
+        append(response.ok ? '로그인했습니다. 연결 버튼을 누르십시오.' : '로그인이 거부되었습니다.');
+      } catch (error) {
+        append('로그인 요청에 실패했습니다.');
+      } finally {
+        password.value = '';
+      }
+    };
+
+    connectButton.onclick = () => {
+      wanted = true;
+      attempt = 0;
+      open();
+      update();
+    };
+
+    disconnectButton.onclick = () => {
+      wanted = false;
+      clearTimeout(retryTimer);
+      if (socket) socket.close(1000, 'user leaving');
+      update();
+    };
+
+    $('#room-form').onsubmit = event => {
+      event.preventDefault();
+      if (isOpen()) socket.send(`JOIN ${$('#room').value}`);
+    };
+
+    $('#form').onsubmit = event => {
+      event.preventDefault();
+      if (!isOpen()) return;
+      if (!room) {
+        append('먼저 채팅방에 입장하십시오.');
+        return;
+      }
+      const text = input.value;
+      if (!text.trim() || new TextEncoder().encode(text).length > 1024) {
+        append('빈칸만이 아닌 1~1024바이트의 메시지를 입력하십시오.');
+        return;
+      }
+      if (outbox.size >= 50 || socket.bufferedAmount > 64 * 1024) {
+        append('확인되지 않은 메시지가 많습니다. 잠시 후 다시 시도하십시오.');
+        return;
+      }
+      const id = newId();
+      outbox.set(id, { room, text });
+      sendSay(id);
+      input.value = '';
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Netty WebSocket 채팅</title>
+  <style>
+    body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem; font-family: sans-serif; }
+    input { width: 70%; padding: .6rem; }
+    button { padding: .6rem; }
+    #log { min-height: 12rem; max-height: 24rem; overflow: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Netty WebSocket 채팅</h1>
+  <p id="status" role="status">연결되지 않았습니다.</p>
+  <form id="login-form">
+    <label for="password">실습 접속 암호</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button>접속 승인 받기</button>
+  </form>
+  <button id="connect">연결</button>
+  <button id="disconnect" disabled>연결 종료</button>
+  <form id="form">
+    <label for="message">메시지</label><br>
+    <input id="message" autocomplete="off" required>
+    <button id="send" disabled>보내기</button>
+  </form>
+  <pre id="log" aria-live="polite"></pre>
+  <script>
+    const status = document.querySelector('#status');
+    const log = document.querySelector('#log');
+    const connect = document.querySelector('#connect');
+    const disconnect = document.querySelector('#disconnect');
+    const send = document.querySelector('#send');
+    const input = document.querySelector('#message');
+    const lines = [];
+    let socket;
+
+    function append(text) {
+      lines.push(text);
+      if (lines.length > 200) lines.shift();
+      log.textContent = lines.join('\n');
+      log.scrollTop = log.scrollHeight;
+    }
+
+    document.querySelector('#login-form').onsubmit = async event => {
+      event.preventDefault();
+      const password = document.querySelector('#password');
+      try {
+        const response = await fetch('/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain; charset=UTF-8' },
+          credentials: 'same-origin',
+          body: password.value
+        });
+        append(response.ok ? '승인되었습니다. 연결 버튼을 누르십시오.' : '접속 승인이 거부되었습니다.');
+      } catch (error) {
+        append('접속 승인 요청에 실패했습니다.');
+      } finally {
+        password.value = '';
+      }
+    };
+
+    connect.onclick = () => {
+      if (socket && socket.readyState !== WebSocket.CLOSED) return;
+      const url = new URL('/ws', location.href);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const current = new WebSocket(url);
+      socket = current;
+      connect.disabled = true;
+      status.textContent = '연결 중입니다.';
+      current.onopen = () => {
+        status.textContent = '채팅에 연결되었습니다.';
+        send.disabled = false;
+        disconnect.disabled = false;
+      };
+      current.onmessage = event => append(String(event.data));
+      current.onerror = () => append('연결 오류가 발생했습니다. 개발자 도구를 확인하십시오.');
+      current.onclose = event => {
+        if (socket !== current) return;
+        status.textContent = `연결 종료: 코드 ${event.code}`;
+        connect.disabled = false;
+        disconnect.disabled = true;
+        send.disabled = true;
+      };
+    };
+
+    disconnect.onclick = () => {
+      if (socket) socket.close(1000, 'user leaving');
+      send.disabled = true;
+    };
+
+    document.querySelector('#form').onsubmit = event => {
+      event.preventDefault();
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const text = input.value;
+      if (!text.trim() || new TextEncoder().encode(text).length > 1024) {
+        append('빈칸만이 아닌 1~1024바이트의 메시지를 입력하십시오.');
+        return;
+      }
+      if (socket.bufferedAmount > 64 * 1024) {
+        append('아직 전송 중인 데이터가 많습니다. 잠시 후 다시 시도하십시오.');
+        return;
+      }
+      socket.send(text);
+      input.value = '';
+    };
+  </script>
+</body>
+</html>
